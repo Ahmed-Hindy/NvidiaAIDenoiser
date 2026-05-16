@@ -11,6 +11,7 @@ find_package(CUDA 12.9 REQUIRED)
 
 find_package(OpenImageIO CONFIG REQUIRED)
 find_package(OpenEXR CONFIG REQUIRED)
+find_package(Imath CONFIG REQUIRED)
 
 message(STATUS "Found OpenImageIO: ${OpenImageIO_DIR}"
                " (includes: ${OpenImageIO_INCLUDE_DIRS}, library: ${OpenImageIO_LIBRARIES})")
@@ -31,7 +32,8 @@ add_executable(${PROJECT_NAME} ${SOURCES})
 target_link_libraries(${PROJECT_NAME}
                       ${CUDA_cudart_static_LIBRARY}
                       openimageio::openimageio
-                      OpenEXR::OpenEXR)
+                      OpenEXR::OpenEXR
+                      Imath::Imath)
 
 # Install app and Conan OpenImageIO artifacts explicitly.
 install(TARGETS ${PROJECT_NAME}
