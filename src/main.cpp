@@ -376,12 +376,22 @@ bool writeMultipartOutput(
         }
         else
         {
-            const OIIO::ImageSpec& spec = input->spec();
-            std::vector<float> pixels(spec.width * spec.height * spec.nchannels);
-            if (!input->read_image(OIIO::TypeDesc::FLOAT, pixels.data()))
+            OIIO::ImageBuf source_plane(multipart.filename, subimage.index, 0);
+            if (!source_plane.init_spec(multipart.filename, subimage.index, 0))
+            {
+                PrintError("Could not load unchanged subimage %d from %s", subimage.index, multipart.filename.c_str());
+                PrintError("[OIIO]: %s", source_plane.geterror().c_str());
+                output->close();
+                input->close();
+                return false;
+            }
+
+            OIIO::ROI roi = OIIO::get_roi_full(source_plane.spec());
+            std::vector<float> pixels(roi.width() * roi.height() * roi.nchannels());
+            if (!source_plane.get_pixels(roi, OIIO::TypeDesc::FLOAT, pixels.data()))
             {
                 PrintError("Could not read unchanged subimage %d from %s", subimage.index, multipart.filename.c_str());
-                PrintError("[OIIO]: %s", input->geterror().c_str());
+                PrintError("[OIIO]: %s", source_plane.geterror().c_str());
                 output->close();
                 input->close();
                 return false;
