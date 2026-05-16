@@ -10,8 +10,17 @@
 #include <iomanip>
 #include <OpenImageIO/imageio.h>
 #include <OpenImageIO/imagebuf.h>
+#include <OpenEXR/ImfChannelList.h>
+#include <OpenEXR/ImfFrameBuffer.h>
+#include <OpenEXR/ImfHeader.h>
+#include <OpenEXR/ImfMultiPartInputFile.h>
+#include <OpenEXR/ImfMultiPartOutputFile.h>
+#include <OpenEXR/ImfOutputPart.h>
+#include <OpenEXR/ImfPartType.h>
+#include <Imath/half.h>
 #include <stdio.h>
 #include <exception>
+#include <cstring>
 
 #include <time.h>
 #include <thread>
@@ -45,7 +54,6 @@ struct SubimageInfo
 {
     int index = 0;
     std::string name;
-    std::string color_space;
     OIIO::ImageSpec spec;
 };
 
@@ -228,15 +236,179 @@ std::string subimageName(const OIIO::ImageSpec& spec, int index)
     return "subimage_" + std::to_string(index);
 }
 
-void applyPreservedMetadata(OIIO::ImageSpec& spec, const SubimageInfo& subimage)
+size_t exrChannelSize(OPENEXR_IMF_NAMESPACE::PixelType type)
 {
-    if (!subimage.color_space.empty())
+    switch (type)
     {
-#if OIIO_VERSION >= 20500
-        spec.set_colorspace(subimage.color_space);
-#endif
-        spec.attribute("oiio:ColorSpace", subimage.color_space);
+    case OPENEXR_IMF_NAMESPACE::HALF:
+        return sizeof(IMATH_NAMESPACE::half);
+    case OPENEXR_IMF_NAMESPACE::FLOAT:
+        return sizeof(float);
+    case OPENEXR_IMF_NAMESPACE::UINT:
+        return sizeof(unsigned int);
+    default:
+        return 0;
     }
+}
+
+int findChannelIndex(const OIIO::ImageSpec& spec, const char* channel_name)
+{
+    for (int i = 0; i < static_cast<int>(spec.channelnames.size()); ++i)
+    {
+        if (spec.channelnames[i] == channel_name)
+            return i;
+    }
+    return -1;
+}
+
+struct NativeEXRPlane
+{
+    std::vector<unsigned char> pixels;
+    std::vector<size_t> channel_offsets;
+    size_t pixel_stride = 0;
+};
+
+bool packNativeEXRPlane(
+    const std::vector<float>& source_pixels,
+    const OIIO::ImageSpec& spec,
+    const OPENEXR_IMF_NAMESPACE::Header& header,
+    NativeEXRPlane& native_plane)
+{
+    const IMATH_NAMESPACE::Box2i data_window = header.dataWindow();
+    const size_t width = static_cast<size_t>(data_window.max.x - data_window.min.x + 1);
+    const size_t height = static_cast<size_t>(data_window.max.y - data_window.min.y + 1);
+    const size_t expected_values = width * height * static_cast<size_t>(spec.nchannels);
+    if (source_pixels.size() != expected_values)
+    {
+        const std::string spec_name(spec.get_string_attribute("name"));
+        PrintError("Pixel buffer size mismatch for subimage '%s': expected %zu values, got %zu",
+            spec_name.c_str(), expected_values, source_pixels.size());
+        return false;
+    }
+
+    native_plane = NativeEXRPlane();
+    const OPENEXR_IMF_NAMESPACE::ChannelList& channels = header.channels();
+    for (OPENEXR_IMF_NAMESPACE::ChannelList::ConstIterator it = channels.begin(); it != channels.end(); ++it)
+    {
+        const size_t channel_size = exrChannelSize(it.channel().type);
+        if (!channel_size)
+        {
+            PrintError("Unsupported OpenEXR channel type in '%s'", it.name());
+            return false;
+        }
+        if (it.channel().xSampling != 1 || it.channel().ySampling != 1)
+        {
+            PrintError("Unsupported subsampled OpenEXR channel '%s'", it.name());
+            return false;
+        }
+        native_plane.channel_offsets.push_back(native_plane.pixel_stride);
+        native_plane.pixel_stride += channel_size;
+    }
+
+    native_plane.pixels.resize(width * height * native_plane.pixel_stride);
+    size_t header_channel = 0;
+    for (OPENEXR_IMF_NAMESPACE::ChannelList::ConstIterator it = channels.begin(); it != channels.end(); ++it, ++header_channel)
+    {
+        const int source_channel = findChannelIndex(spec, it.name());
+        if (source_channel < 0)
+        {
+            PrintError("Could not map OpenEXR channel '%s' to OIIO subimage channels", it.name());
+            return false;
+        }
+
+        const size_t channel_offset = native_plane.channel_offsets[header_channel];
+        for (size_t pixel = 0; pixel < width * height; ++pixel)
+        {
+            const float value = source_pixels[pixel * static_cast<size_t>(spec.nchannels) + static_cast<size_t>(source_channel)];
+            unsigned char* destination = native_plane.pixels.data() + pixel * native_plane.pixel_stride + channel_offset;
+            switch (it.channel().type)
+            {
+            case OPENEXR_IMF_NAMESPACE::HALF:
+            {
+                IMATH_NAMESPACE::half half_value(value);
+                std::memcpy(destination, &half_value, sizeof(half_value));
+                break;
+            }
+            case OPENEXR_IMF_NAMESPACE::FLOAT:
+                std::memcpy(destination, &value, sizeof(value));
+                break;
+            case OPENEXR_IMF_NAMESPACE::UINT:
+            {
+                const unsigned int uint_value = value <= 0.0f ? 0u : static_cast<unsigned int>(value);
+                std::memcpy(destination, &uint_value, sizeof(uint_value));
+                break;
+            }
+            default:
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+bool readMultipartSourcePlane(
+    const MultipartOptions& multipart,
+    const SubimageInfo& subimage,
+    std::vector<float>& pixels)
+{
+    OIIO::ImageBuf source_plane(multipart.filename, subimage.index, 0);
+    if (!source_plane.init_spec(multipart.filename, subimage.index, 0))
+    {
+        PrintError("Could not load unchanged subimage %d from %s", subimage.index, multipart.filename.c_str());
+        PrintError("[OIIO]: %s", source_plane.geterror().c_str());
+        return false;
+    }
+
+    OIIO::ROI roi = OIIO::get_roi_full(source_plane.spec());
+    pixels.resize(roi.width() * roi.height() * roi.nchannels());
+    if (!source_plane.get_pixels(roi, OIIO::TypeDesc::FLOAT, pixels.data()))
+    {
+        PrintError("Could not read unchanged subimage %d from %s", subimage.index, multipart.filename.c_str());
+        PrintError("[OIIO]: %s", source_plane.geterror().c_str());
+        return false;
+    }
+    return true;
+}
+
+bool writeNativeEXRPart(
+    OPENEXR_IMF_NAMESPACE::MultiPartOutputFile& output,
+    int output_part,
+    const OPENEXR_IMF_NAMESPACE::Header& header,
+    const OIIO::ImageSpec& spec,
+    const std::vector<float>& pixels)
+{
+    NativeEXRPlane native_plane;
+    if (!packNativeEXRPlane(pixels, spec, header, native_plane))
+        return false;
+
+    const IMATH_NAMESPACE::Box2i data_window = header.dataWindow();
+    const int width = data_window.max.x - data_window.min.x + 1;
+    const int height = data_window.max.y - data_window.min.y + 1;
+    const size_t row_stride = native_plane.pixel_stride * static_cast<size_t>(width);
+
+    OPENEXR_IMF_NAMESPACE::FrameBuffer frame_buffer;
+    size_t channel = 0;
+    for (OPENEXR_IMF_NAMESPACE::ChannelList::ConstIterator it = header.channels().begin(); it != header.channels().end(); ++it, ++channel)
+    {
+        char* base = reinterpret_cast<char*>(native_plane.pixels.data() + native_plane.channel_offsets[channel]);
+        base -= static_cast<ptrdiff_t>(data_window.min.x) * static_cast<ptrdiff_t>(native_plane.pixel_stride);
+        base -= static_cast<ptrdiff_t>(data_window.min.y) * static_cast<ptrdiff_t>(row_stride);
+        frame_buffer.insert(
+            it.name(),
+            OPENEXR_IMF_NAMESPACE::Slice(
+                it.channel().type,
+                base,
+                native_plane.pixel_stride,
+                row_stride,
+                it.channel().xSampling,
+                it.channel().ySampling));
+    }
+
+    OPENEXR_IMF_NAMESPACE::OutputPart part(output, output_part);
+    part.setFrameBuffer(frame_buffer);
+    part.writePixels(height);
+    return true;
 }
 
 bool loadMultipartLayout(MultipartOptions& multipart)
@@ -254,8 +426,7 @@ bool loadMultipartLayout(MultipartOptions& multipart)
     {
         const OIIO::ImageSpec& spec = input->spec();
         const std::string name = subimageName(spec, subimage);
-        const std::string color_space = spec.get_string_attribute("oiio:ColorSpace");
-        multipart.subimages.push_back(SubimageInfo{subimage, name, color_space, spec});
+        multipart.subimages.push_back(SubimageInfo{subimage, name, spec});
     }
     input->close();
 
@@ -325,23 +496,6 @@ bool writeMultipartOutput(
     const std::vector<float>& beauty_pixels,
     const std::vector<std::vector<float> >& aov_pixels)
 {
-    auto input = OIIO::ImageInput::open(multipart.filename);
-    if (!input)
-    {
-        PrintError("Could not open multipart input %s", multipart.filename.c_str());
-        PrintError("[OIIO]: %s", OIIO::geterror().c_str());
-        return false;
-    }
-
-    auto output = OIIO::ImageOutput::create(out_path);
-    if (!output)
-    {
-        PrintError("Could not create multipart output %s", out_path.c_str());
-        PrintError("[OIIO]: %s", OIIO::geterror().c_str());
-        input->close();
-        return false;
-    }
-
     std::map<int, const std::vector<float>*> replacements;
     replacements[g_input_beauty.subimage_index] = &beauty_pixels;
     int aov_index = 0;
@@ -351,99 +505,66 @@ bool writeMultipartOutput(
         aov_index++;
     }
 
-    std::vector<OIIO::ImageSpec> specs;
-    specs.reserve(multipart.subimages.size());
-    for (const auto& subimage : multipart.subimages)
+    try
     {
-        OIIO::ImageSpec spec = subimage.spec;
-        applyPreservedMetadata(spec, subimage);
-        specs.push_back(spec);
-    }
-
-    if (!output->open(out_path, static_cast<int>(specs.size()), specs.data()))
-    {
-        PrintError("Could not open multipart output %s", out_path.c_str());
-        PrintError("[OIIO]: %s", output->geterror().c_str());
-        output->close();
-        input->close();
-        return false;
-    }
-
-    bool first_subimage = true;
-    size_t subimage_number = 0;
-    for (const auto& subimage : multipart.subimages)
-    {
-        const OIIO::ImageSpec& output_spec = specs[subimage_number];
-        if (!input->seek_subimage(subimage.index, 0))
+        OPENEXR_IMF_NAMESPACE::MultiPartInputFile source_file(multipart.filename.c_str());
+        if (source_file.parts() != static_cast<int>(multipart.subimages.size()))
         {
-            PrintError("Could not seek to subimage %d in %s", subimage.index, multipart.filename.c_str());
-            PrintError("[OIIO]: %s", input->geterror().c_str());
-            output->close();
-            input->close();
+            PrintError("OpenEXR part count mismatch for %s", multipart.filename.c_str());
             return false;
         }
 
-        if (!first_subimage)
+        std::vector<OPENEXR_IMF_NAMESPACE::Header> headers;
+        headers.reserve(multipart.subimages.size());
+        for (const auto& subimage : multipart.subimages)
         {
-            if (!output->open(out_path, output_spec, OIIO::ImageOutput::AppendSubimage))
+            const OPENEXR_IMF_NAMESPACE::Header& header = source_file.header(subimage.index);
+            if (std::string(header.type()) != OPENEXR_IMF_NAMESPACE::SCANLINEIMAGE)
             {
-                PrintError("Could not advance to output subimage %d for %s", subimage.index, out_path.c_str());
-                PrintError("[OIIO]: %s", output->geterror().c_str());
-                output->close();
-                input->close();
+                PrintError("Only scanline multipart OpenEXR parts are supported for metadata-preserving output");
                 return false;
             }
+            headers.push_back(header);
         }
-        first_subimage = false;
-        subimage_number++;
 
-        const auto replacement = replacements.find(subimage.index);
-        if (replacement != replacements.end())
-        {
-            if (!output->write_image(OIIO::TypeDesc::FLOAT, replacement->second->data()))
-            {
-                PrintError("Could not write denoised subimage %d to %s", subimage.index, out_path.c_str());
-                PrintError("[OIIO]: %s", output->geterror().c_str());
-                output->close();
-                input->close();
-                return false;
-            }
-        }
-        else
-        {
-            OIIO::ImageBuf source_plane(multipart.filename, subimage.index, 0);
-            if (!source_plane.init_spec(multipart.filename, subimage.index, 0))
-            {
-                PrintError("Could not load unchanged subimage %d from %s", subimage.index, multipart.filename.c_str());
-                PrintError("[OIIO]: %s", source_plane.geterror().c_str());
-                output->close();
-                input->close();
-                return false;
-            }
+        OPENEXR_IMF_NAMESPACE::MultiPartOutputFile output(
+            out_path.c_str(),
+            headers.data(),
+            static_cast<int>(headers.size()));
 
-            OIIO::ROI roi = OIIO::get_roi_full(source_plane.spec());
-            std::vector<float> pixels(roi.width() * roi.height() * roi.nchannels());
-            if (!source_plane.get_pixels(roi, OIIO::TypeDesc::FLOAT, pixels.data()))
+        int output_part = 0;
+        for (const auto& subimage : multipart.subimages)
+        {
+            const auto replacement = replacements.find(subimage.index);
+            if (replacement != replacements.end())
             {
-                PrintError("Could not read unchanged subimage %d from %s", subimage.index, multipart.filename.c_str());
-                PrintError("[OIIO]: %s", source_plane.geterror().c_str());
-                output->close();
-                input->close();
-                return false;
+                if (!writeNativeEXRPart(output, output_part, headers[output_part], subimage.spec, *replacement->second))
+                {
+                    PrintError("Could not write denoised subimage %d to %s", subimage.index, out_path.c_str());
+                    return false;
+                }
             }
-            if (!output->write_image(OIIO::TypeDesc::FLOAT, pixels.data()))
+            else
             {
-                PrintError("Could not write unchanged subimage %d to %s", subimage.index, out_path.c_str());
-                PrintError("[OIIO]: %s", output->geterror().c_str());
-                output->close();
-                input->close();
-                return false;
+                std::vector<float> source_pixels;
+                if (!readMultipartSourcePlane(multipart, subimage, source_pixels))
+                    return false;
+
+                if (!writeNativeEXRPart(output, output_part, headers[output_part], subimage.spec, source_pixels))
+                {
+                    PrintError("Could not write unchanged subimage %d to %s", subimage.index, out_path.c_str());
+                    return false;
+                }
             }
+            output_part++;
         }
     }
+    catch (const std::exception& e)
+    {
+        PrintError("OpenEXR multipart write failed for %s: %s", out_path.c_str(), e.what());
+        return false;
+    }
 
-    output->close();
-    input->close();
     return true;
 }
 
