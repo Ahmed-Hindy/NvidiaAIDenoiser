@@ -374,13 +374,26 @@ bool writeMultipartOutput(
                 return false;
             }
         }
-        else if (!output->copy_image(input.get()))
+        else
         {
-            PrintError("Could not copy unchanged subimage %d to %s", subimage.index, out_path.c_str());
-            PrintError("[OIIO]: %s", output->geterror().c_str());
-            output->close();
-            input->close();
-            return false;
+            const OIIO::ImageSpec& spec = input->spec();
+            std::vector<float> pixels(spec.width * spec.height * spec.nchannels);
+            if (!input->read_image(OIIO::TypeDesc::FLOAT, pixels.data()))
+            {
+                PrintError("Could not read unchanged subimage %d from %s", subimage.index, multipart.filename.c_str());
+                PrintError("[OIIO]: %s", input->geterror().c_str());
+                output->close();
+                input->close();
+                return false;
+            }
+            if (!output->write_image(OIIO::TypeDesc::FLOAT, pixels.data()))
+            {
+                PrintError("Could not write unchanged subimage %d to %s", subimage.index, out_path.c_str());
+                PrintError("[OIIO]: %s", output->geterror().c_str());
+                output->close();
+                input->close();
+                return false;
+            }
         }
     }
 
