@@ -351,6 +351,7 @@ bool writeMultipartOutput(
         return false;
     }
 
+    bool first_subimage = true;
     for (const auto& subimage : multipart.subimages)
     {
         if (!input->seek_subimage(subimage.index, 0))
@@ -361,6 +362,19 @@ bool writeMultipartOutput(
             input->close();
             return false;
         }
+
+        if (!first_subimage)
+        {
+            if (!output->open(out_path, subimage.spec, OIIO::ImageOutput::AppendSubimage))
+            {
+                PrintError("Could not advance to output subimage %d for %s", subimage.index, out_path.c_str());
+                PrintError("[OIIO]: %s", output->geterror().c_str());
+                output->close();
+                input->close();
+                return false;
+            }
+        }
+        first_subimage = false;
 
         const auto replacement = replacements.find(subimage.index);
         if (replacement != replacements.end())
