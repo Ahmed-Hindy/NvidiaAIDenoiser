@@ -337,24 +337,26 @@ bool writeMultipartOutput(
         aov_index++;
     }
 
-    bool first_subimage = true;
+    std::vector<OIIO::ImageSpec> specs;
+    specs.reserve(multipart.subimages.size());
+    for (const auto& subimage : multipart.subimages)
+        specs.push_back(subimage.spec);
+
+    if (!output->open(out_path, static_cast<int>(specs.size()), specs.data()))
+    {
+        PrintError("Could not open multipart output %s", out_path.c_str());
+        PrintError("[OIIO]: %s", output->geterror().c_str());
+        output->close();
+        input->close();
+        return false;
+    }
+
     for (const auto& subimage : multipart.subimages)
     {
         if (!input->seek_subimage(subimage.index, 0))
         {
             PrintError("Could not seek to subimage %d in %s", subimage.index, multipart.filename.c_str());
             PrintError("[OIIO]: %s", input->geterror().c_str());
-            output->close();
-            input->close();
-            return false;
-        }
-
-        const OIIO::ImageSpec& spec = input->spec();
-        const auto mode = first_subimage ? OIIO::ImageOutput::Create : OIIO::ImageOutput::AppendSubimage;
-        if (!output->open(out_path, spec, mode))
-        {
-            PrintError("Could not open output subimage %d for %s", subimage.index, out_path.c_str());
-            PrintError("[OIIO]: %s", output->geterror().c_str());
             output->close();
             input->close();
             return false;
@@ -380,7 +382,6 @@ bool writeMultipartOutput(
             input->close();
             return false;
         }
-        first_subimage = false;
     }
 
     output->close();
