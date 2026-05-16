@@ -18,7 +18,10 @@
 #include <chrono>
 #include <vector>
 #include <string>
+#include <algorithm>
+#include <cctype>
 #include <map>
+#include <memory>
 #ifdef _WIN32
 #include <windows.h>
 #include <winternl.h>
@@ -33,7 +36,27 @@ struct ImageInfo
     ImageInfo() = default;
     std::string filename;
     std::string output_filename;
-    OIIO::ImageBuf* data;
+    std::string subimage_name;
+    int subimage_index = 0;
+    OIIO::ImageBuf* data = nullptr;
+};
+
+struct SubimageInfo
+{
+    int index = 0;
+    std::string name;
+    OIIO::ImageSpec spec;
+};
+
+struct MultipartOptions
+{
+    bool enabled = false;
+    std::string filename;
+    std::string beauty_name = "C";
+    std::string albedo_name = "albedo";
+    std::string normal_name = "N";
+    std::map<int, std::string> aov_names;
+    std::vector<SubimageInfo> subimages;
 };
 
 // Our global image handles
@@ -60,6 +83,7 @@ std::chrono::high_resolution_clock::time_point g_app_start_time;
 
 // Device count
 std::vector<cudaDeviceProp> g_device_props;
+MultipartOptions g_multipart;
 
 void cleanup()
 {
@@ -187,6 +211,183 @@ inline void imageConvertFormat(float* in_ptr, uint8_t in_size, float* out_ptr, u
     }
 }
 
+std::string toLower(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+std::string subimageName(const OIIO::ImageSpec& spec, int index)
+{
+    std::string name = spec.get_string_attribute("name");
+    if (!name.empty())
+        return name;
+    return "subimage_" + std::to_string(index);
+}
+
+bool loadMultipartLayout(MultipartOptions& multipart)
+{
+    auto input = OIIO::ImageInput::open(multipart.filename);
+    if (!input)
+    {
+        PrintError("Could not open multipart input %s", multipart.filename.c_str());
+        PrintError("[OIIO]: %s", OIIO::geterror().c_str());
+        return false;
+    }
+
+    multipart.subimages.clear();
+    for (int subimage = 0; input->seek_subimage(subimage, 0); ++subimage)
+    {
+        const OIIO::ImageSpec& spec = input->spec();
+        multipart.subimages.push_back(SubimageInfo{subimage, subimageName(spec, subimage), spec});
+    }
+    input->close();
+
+    if (multipart.subimages.empty())
+    {
+        PrintError("No subimages found in multipart input %s", multipart.filename.c_str());
+        return false;
+    }
+    return true;
+}
+
+int findMultipartSubimage(const MultipartOptions& multipart, const std::string& name)
+{
+    const std::string desired = toLower(name);
+    for (const auto& subimage : multipart.subimages)
+    {
+        if (toLower(subimage.name) == desired)
+            return subimage.index;
+    }
+    return -1;
+}
+
+bool loadMultipartPlane(
+    const MultipartOptions& multipart,
+    const std::string& plane_name,
+    ImageInfo& image,
+    const char* label)
+{
+    const int subimage = findMultipartSubimage(multipart, plane_name);
+    if (subimage < 0)
+    {
+        PrintError("Could not find %s subimage '%s' in %s", label, plane_name.c_str(), multipart.filename.c_str());
+        return false;
+    }
+
+    image.filename = multipart.filename;
+    image.subimage_name = plane_name;
+    image.subimage_index = subimage;
+    image.data = new OIIO::ImageBuf(multipart.filename, subimage, 0);
+    if (!image.data->init_spec(multipart.filename, subimage, 0))
+    {
+        PrintError("Failed to load %s subimage '%s'", label, plane_name.c_str());
+        PrintError("[OIIO]: %s", image.data->geterror().c_str());
+        return false;
+    }
+
+    if (g_verbosity >= 2)
+        PrintInfo("Loaded %s subimage '%s' at index %d", label, plane_name.c_str(), subimage);
+    return true;
+}
+
+std::string outputPathFor(const std::string& input_path, const std::string& output_path, const std::string& suffix)
+{
+    if (suffix.empty())
+        return output_path;
+
+    std::string base = output_path.empty() ? input_path : output_path;
+    const size_t ext_loc = base.find_last_of(".");
+    if (ext_loc == std::string::npos)
+        return base + suffix;
+    return base.substr(0, ext_loc) + suffix + base.substr(ext_loc);
+}
+
+bool writeMultipartOutput(
+    const MultipartOptions& multipart,
+    const std::string& out_path,
+    const std::vector<float>& beauty_pixels,
+    const std::vector<std::vector<float> >& aov_pixels)
+{
+    auto input = OIIO::ImageInput::open(multipart.filename);
+    if (!input)
+    {
+        PrintError("Could not open multipart input %s", multipart.filename.c_str());
+        PrintError("[OIIO]: %s", OIIO::geterror().c_str());
+        return false;
+    }
+
+    auto output = OIIO::ImageOutput::create(out_path);
+    if (!output)
+    {
+        PrintError("Could not create multipart output %s", out_path.c_str());
+        PrintError("[OIIO]: %s", OIIO::geterror().c_str());
+        input->close();
+        return false;
+    }
+
+    std::map<int, const std::vector<float>*> replacements;
+    replacements[g_input_beauty.subimage_index] = &beauty_pixels;
+    int aov_index = 0;
+    for (const auto& it : g_input_aov)
+    {
+        replacements[it.second.subimage_index] = &aov_pixels[aov_index];
+        aov_index++;
+    }
+
+    bool first_subimage = true;
+    for (const auto& subimage : multipart.subimages)
+    {
+        if (!input->seek_subimage(subimage.index, 0))
+        {
+            PrintError("Could not seek to subimage %d in %s", subimage.index, multipart.filename.c_str());
+            PrintError("[OIIO]: %s", input->geterror().c_str());
+            output->close();
+            input->close();
+            return false;
+        }
+
+        const OIIO::ImageSpec& spec = input->spec();
+        const auto mode = first_subimage ? OIIO::ImageOutput::Create : OIIO::ImageOutput::AppendSubimage;
+        if (!output->open(out_path, spec, mode))
+        {
+            PrintError("Could not open output subimage %d for %s", subimage.index, out_path.c_str());
+            PrintError("[OIIO]: %s", output->geterror().c_str());
+            output->close();
+            input->close();
+            return false;
+        }
+
+        const auto replacement = replacements.find(subimage.index);
+        if (replacement != replacements.end())
+        {
+            if (!output->write_image(OIIO::TypeDesc::FLOAT, replacement->second->data()))
+            {
+                PrintError("Could not write denoised subimage %d to %s", subimage.index, out_path.c_str());
+                PrintError("[OIIO]: %s", output->geterror().c_str());
+                output->close();
+                input->close();
+                return false;
+            }
+        }
+        else if (!output->copy_image(input.get()))
+        {
+            PrintError("Could not copy unchanged subimage %d to %s", subimage.index, out_path.c_str());
+            PrintError("[OIIO]: %s", output->geterror().c_str());
+            output->close();
+            input->close();
+            return false;
+        }
+        first_subimage = false;
+    }
+
+    output->close();
+    input->close();
+    return true;
+}
+
 void printParams()
 {
     // Always print parameters if needed
@@ -200,6 +401,11 @@ void printParams()
     PrintInfo("-oaov%d [string] : path to additional AOV output image to denoise");
     PrintInfo("-o [string]      : path to output image");
     PrintInfo("-os [string]     : output suffix appended to input filename to create output image filename");
+    PrintInfo("-multipart [string]    : path to multipart EXR input; loads planes by subimage name");
+    PrintInfo("-beauty-name [string]  : beauty subimage name for -multipart (default C)");
+    PrintInfo("-albedo-name [string]  : albedo subimage name for -multipart (default albedo)");
+    PrintInfo("-normal-name [string]  : normal subimage name for -multipart (default N)");
+    PrintInfo("-aov-name%d [string]   : additional multipart AOV subimage name to denoise");
     PrintInfo("-a [string]      : path to input albedo AOV (optional)");
     PrintInfo("-n [string]      : path to input normal AOV (optional, requires albedo AOV)");
     PrintInfo("-mv [string]     : path to motion vector AOV (optional, required for temporal denoising)");
@@ -354,6 +560,49 @@ int main(int argc, char *argv[])
             output_internal_data_filename = std::string(argv[i]);
             if (g_verbosity >= 2)
                 PrintInfo("Current frame denoiser-internal data: %s", output_internal_data_filename.c_str());
+        }
+        else if (arg == "-multipart")
+        {
+            i++;
+            g_multipart.enabled = true;
+            g_multipart.filename = std::string(argv[i]);
+            if (g_verbosity >= 2)
+                PrintInfo("Multipart input image: %s", g_multipart.filename.c_str());
+        }
+        else if (arg == "-beauty-name")
+        {
+            i++;
+            g_multipart.beauty_name = std::string(argv[i]);
+            if (g_verbosity >= 2)
+                PrintInfo("Multipart beauty subimage: %s", g_multipart.beauty_name.c_str());
+        }
+        else if (arg == "-albedo-name")
+        {
+            i++;
+            g_multipart.albedo_name = std::string(argv[i]);
+            if (g_verbosity >= 2)
+                PrintInfo("Multipart albedo subimage: %s", g_multipart.albedo_name.c_str());
+        }
+        else if (arg == "-normal-name")
+        {
+            i++;
+            g_multipart.normal_name = std::string(argv[i]);
+            if (g_verbosity >= 2)
+                PrintInfo("Multipart normal subimage: %s", g_multipart.normal_name.c_str());
+        }
+        else if (arg.find("-aov-name") != std::string::npos)
+        {
+            if (arg.size() == 9)
+            {
+                PrintError("-aov-name parameter requires number id such as -aov-name0");
+                cleanup();
+                exitfunc(EXIT_FAILURE);
+            }
+            int aov_id = std::stoi(arg.substr(9, arg.size()));
+            i++;
+            g_multipart.aov_names[aov_id] = std::string(argv[i]);
+            if (g_verbosity >= 2)
+                PrintInfo("Multipart AOV %d subimage: %s", aov_id, g_multipart.aov_names[aov_id].c_str());
         }
         else if (arg.find("-aov") != std::string::npos)
         {
@@ -540,6 +789,71 @@ int main(int argc, char *argv[])
         else if (arg == "-h" || arg == "--help")
         {
             printParams();
+        }
+    }
+
+    if (g_multipart.enabled)
+    {
+        if (b_loaded || a_loaded || n_loaded || denoise_aovs)
+        {
+            PrintError("-multipart cannot be combined with -i, -a, -n, or -aov inputs");
+            cleanup();
+            exitfunc(EXIT_FAILURE);
+        }
+
+        if (!loadMultipartLayout(g_multipart))
+        {
+            cleanup();
+            exitfunc(EXIT_FAILURE);
+        }
+
+        if (!loadMultipartPlane(g_multipart, g_multipart.beauty_name, g_input_beauty, "beauty"))
+        {
+            cleanup();
+            exitfunc(EXIT_FAILURE);
+        }
+        b_loaded = true;
+
+        const int albedo_index = findMultipartSubimage(g_multipart, g_multipart.albedo_name);
+        if (albedo_index >= 0)
+        {
+            if (!loadMultipartPlane(g_multipart, g_multipart.albedo_name, g_input_albedo, "albedo"))
+            {
+                cleanup();
+                exitfunc(EXIT_FAILURE);
+            }
+            a_loaded = true;
+        }
+        else
+        {
+            PrintWarning("Multipart albedo subimage '%s' was not found; denoising without albedo guide", g_multipart.albedo_name.c_str());
+        }
+
+        const int normal_index = findMultipartSubimage(g_multipart, g_multipart.normal_name);
+        if (normal_index >= 0)
+        {
+            if (!loadMultipartPlane(g_multipart, g_multipart.normal_name, g_input_normal, "normal"))
+            {
+                cleanup();
+                exitfunc(EXIT_FAILURE);
+            }
+            n_loaded = true;
+        }
+        else
+        {
+            PrintWarning("Multipart normal subimage '%s' was not found; denoising without normal guide", g_multipart.normal_name.c_str());
+        }
+
+        for (const auto& aov_name : g_multipart.aov_names)
+        {
+            ImageInfo info;
+            if (!loadMultipartPlane(g_multipart, aov_name.second, info, "AOV"))
+            {
+                cleanup();
+                exitfunc(EXIT_FAILURE);
+            }
+            g_input_aov[aov_name.first] = info;
+            denoise_aovs = true;
         }
     }
 
@@ -1017,24 +1331,33 @@ int main(int argc, char *argv[])
     CU_CHECK(cudaStreamDestroy(cuda_stream));
 
 
+    const std::string input_path = g_multipart.enabled ? g_multipart.filename : g_input_beauty.filename;
+    const std::string out_path = outputPathFor(input_path, g_input_beauty.output_filename, out_suffix);
+
+    if (g_multipart.enabled)
+    {
+        remove(out_path.c_str());
+        if (writeMultipartOutput(g_multipart, out_path, beauty_pixels, aov_pixels))
+            PrintInfo("Written out: %s", out_path.c_str());
+        else
+        {
+            cleanup();
+            exitfunc(EXIT_FAILURE);
+        }
+
+        PrintInfo("Done!");
+        cleanup();
+        exitfunc(EXIT_SUCCESS);
+    }
+
     // If the image already exists delete it
-    remove(g_input_beauty.output_filename.c_str());
+    remove(out_path.c_str());
 
     // Set our OIIO pixels
     if (!g_input_beauty.data->set_pixels(beauty_roi, OIIO::TypeDesc::FLOAT, &beauty_pixels[0]))
         PrintError("Something went wrong setting pixels of file %s", g_input_beauty.filename.c_str());
 
     // Save the output image
-    std::string out_path = g_input_beauty.output_filename;
-    if (!out_suffix.empty())
-    {
-        if (g_input_beauty.output_filename.empty())
-            g_input_beauty.output_filename = g_input_beauty.filename;
-        int ext_loc = (int)g_input_beauty.output_filename.find_last_of(".");
-        const char* ext_c = g_input_beauty.output_filename.c_str()+ext_loc;
-        std::string ext(ext_c);
-        out_path = g_input_beauty.output_filename.substr(0, ext_loc) + out_suffix + ext_c;
-    }
     if (g_input_beauty.data->write(out_path))
         PrintInfo("Written out: %s", out_path.c_str());
     else
