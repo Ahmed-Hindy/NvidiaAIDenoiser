@@ -45,6 +45,7 @@ struct SubimageInfo
 {
     int index = 0;
     std::string name;
+    std::string color_space;
     OIIO::ImageSpec spec;
 };
 
@@ -227,6 +228,17 @@ std::string subimageName(const OIIO::ImageSpec& spec, int index)
     return "subimage_" + std::to_string(index);
 }
 
+void applyPreservedMetadata(OIIO::ImageSpec& spec, const SubimageInfo& subimage)
+{
+    if (!subimage.color_space.empty())
+    {
+#if OIIO_VERSION >= 20500
+        spec.set_colorspace(subimage.color_space);
+#endif
+        spec.attribute("oiio:ColorSpace", subimage.color_space);
+    }
+}
+
 bool loadMultipartLayout(MultipartOptions& multipart)
 {
     auto input = OIIO::ImageInput::open(multipart.filename);
@@ -241,7 +253,9 @@ bool loadMultipartLayout(MultipartOptions& multipart)
     for (int subimage = 0; input->seek_subimage(subimage, 0); ++subimage)
     {
         const OIIO::ImageSpec& spec = input->spec();
-        multipart.subimages.push_back(SubimageInfo{subimage, subimageName(spec, subimage), spec});
+        const std::string name = subimageName(spec, subimage);
+        const std::string color_space = spec.get_string_attribute("oiio:ColorSpace");
+        multipart.subimages.push_back(SubimageInfo{subimage, name, color_space, spec});
     }
     input->close();
 
@@ -340,7 +354,11 @@ bool writeMultipartOutput(
     std::vector<OIIO::ImageSpec> specs;
     specs.reserve(multipart.subimages.size());
     for (const auto& subimage : multipart.subimages)
-        specs.push_back(subimage.spec);
+    {
+        OIIO::ImageSpec spec = subimage.spec;
+        applyPreservedMetadata(spec, subimage);
+        specs.push_back(spec);
+    }
 
     if (!output->open(out_path, static_cast<int>(specs.size()), specs.data()))
     {
@@ -352,8 +370,10 @@ bool writeMultipartOutput(
     }
 
     bool first_subimage = true;
+    size_t subimage_number = 0;
     for (const auto& subimage : multipart.subimages)
     {
+        const OIIO::ImageSpec& output_spec = specs[subimage_number];
         if (!input->seek_subimage(subimage.index, 0))
         {
             PrintError("Could not seek to subimage %d in %s", subimage.index, multipart.filename.c_str());
@@ -365,7 +385,7 @@ bool writeMultipartOutput(
 
         if (!first_subimage)
         {
-            if (!output->open(out_path, subimage.spec, OIIO::ImageOutput::AppendSubimage))
+            if (!output->open(out_path, output_spec, OIIO::ImageOutput::AppendSubimage))
             {
                 PrintError("Could not advance to output subimage %d for %s", subimage.index, out_path.c_str());
                 PrintError("[OIIO]: %s", output->geterror().c_str());
@@ -375,6 +395,7 @@ bool writeMultipartOutput(
             }
         }
         first_subimage = false;
+        subimage_number++;
 
         const auto replacement = replacements.find(subimage.index);
         if (replacement != replacements.end())
