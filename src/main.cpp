@@ -18,7 +18,7 @@
 #include <chrono>
 #include <vector>
 #include <string>
-#include <unordered_map>
+#include <map>
 #ifdef _WIN32
 #include <windows.h>
 #include <winternl.h>
@@ -42,7 +42,7 @@ ImageInfo g_input_prev_denoised_frame;
 ImageInfo g_input_albedo;
 ImageInfo g_input_normal;
 ImageInfo g_input_motion_vectors;
-std::unordered_map<int, ImageInfo> g_input_aov;
+std::map<int, ImageInfo> g_input_aov;
 
 // Previous frame denoiser-internal data, given on the command line. It is a binary file
 // written by the denoiser (-oid).
@@ -960,7 +960,7 @@ int main(int argc, char *argv[])
     auto aov_it = g_input_aov.begin();
     for (unsigned int i = 0; i < num_layers; i++)
     {
-        std::vector<float>& output = (i == 0) ? beauty_pixels : aov_pixels[0];
+        std::vector<float>& output = (i == 0) ? beauty_pixels : aov_pixels[i - 1];
         unsigned int num_channels = 0;
         if (i == 0)
         {
