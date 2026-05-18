@@ -277,12 +277,12 @@ OptiX 9.0 -> v9.0.0 -> fff65c2a7c592f1ea5f1661ad7d2381cf965f9bd -> Denoiser.exe 
 OptiX 9.1 -> v9.1.0 -> f1f6dd803f3159992d248178f6e09421c6eb8b6d -> Denoiser.exe 78138880 bytes
 ```
 
-Local `Denoiser.exe -h` sanity on RTX 3070:
+Local `Denoiser.exe -h` sanity on RTX 3070 with NVIDIA driver `576.80`:
 
 ```text
 OptiX 8.1 -> found GPU, printed help
 OptiX 9.0 -> found GPU, printed help
-OptiX 9.1 -> found GPU, failed optixInit with error 7801
+OptiX 9.1 -> found GPU, failed optixInit with error 7801 because this workstation does not have the NVIDIA driver version required by OptiX 9.1
 ```
 
 Local Canyon Run multipart denoise smoke:
@@ -290,7 +290,7 @@ Local Canyon Run multipart denoise smoke:
 ```text
 OptiX 8.1 -> denoise succeeded, output 66147779 bytes
 OptiX 9.0 -> denoise succeeded, output 66147779 bytes
-OptiX 9.1 -> not run because -h sanity failed OptiX initialization
+OptiX 9.1 -> not run on this workstation because the local NVIDIA driver is below the OptiX 9.1 runtime requirement
 ```
 
 Raw EXR header comparison for OptiX 8.1 and 9.0:
@@ -314,10 +314,13 @@ Raw EXR header comparison for OptiX 8.1 and 9.0:
 
 ## Notes For Future Agents
 
-- OptiX 9.0 (`fff65c2a7c592f1ea5f1661ad7d2381cf965f9bd`) is the currently
-  validated runtime build on this workstation. Treat OptiX 8.1 and 9.1 builds
-  as compatibility variants until they are tested with the same Canyon Run
-  metadata workflow.
+- OptiX 8.1 (`50021ea0af6d41609a97777ceebbdf1e1d34efe7`) and OptiX 9.0
+  (`fff65c2a7c592f1ea5f1661ad7d2381cf965f9bd`) are validated runtime builds
+  on this workstation.
+- OptiX 9.1 (`f1f6dd803f3159992d248178f6e09421c6eb8b6d`) builds successfully
+  and should remain in the release as a newer-driver compatibility variant.
+  Its local `optixInit` failure is expected on the current workstation because
+  the installed NVIDIA driver is below the OptiX 9.1 runtime requirement.
 - Hosted GitHub runners can prove build and packaging, but runtime validation
   still needs a machine with an NVIDIA GPU.
 - Git on this workstation needed `http.sslBackend = schannel` to avoid local

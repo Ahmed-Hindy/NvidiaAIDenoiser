@@ -244,7 +244,7 @@ jobs:
 
           Runtime note: GitHub-hosted runners validate build and packaging only.
           Local RTX 3070 validation for this experiment passed Canyon Run multipart metadata smoke for OptiX 8.1 and 9.0.
-          The OptiX 9.1 build is included for compatibility testing, but previously failed local OptiX initialization with error ``7801`` on this workstation.
+          The OptiX 9.1 build is included for users with a sufficiently new NVIDIA driver; it previously failed local OptiX initialization with error ``7801`` on a workstation whose installed driver was below the OptiX 9.1 runtime requirement.
           "@
           $notesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
           $notes.Trim() | Set-Content -LiteralPath $notesPath -Encoding utf8NoBOM
