@@ -10,7 +10,7 @@ The workflow lives at `.github/workflows/optix-windows-build.yml` and runs on:
 What it does:
 
 - checks out the repository with the `contrib/optix` submodule
-- installs CUDA Toolkit 12.9.0
+- installs CUDA Toolkit 12.9.0 with the NVIDIA network installer
 - installs Conan 2
 - builds the C++ denoiser with CMake and Visual Studio 2022
 - installs `Denoiser.exe` into `out/bin`
