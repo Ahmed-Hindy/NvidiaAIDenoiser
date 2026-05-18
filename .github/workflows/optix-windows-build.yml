@@ -1,0 +1,129 @@
+name: OptiX Windows Build
+
+on:
+  push:
+    branches:
+      - ci/github-optix-build-experiment
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BUILD_TYPE: Release
+  CUDA_VERSION: "12.9.0"
+
+jobs:
+  build-windows:
+    name: Build Denoiser.exe
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+
+      - name: Install Conan
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "conan>=2,<3"
+          conan --version
+
+      - name: Install C++ dependencies
+        shell: pwsh
+        run: |
+          conan profile detect --force
+          conan install . `
+            --build=missing `
+            -s:h compiler.cppstd=20 `
+            -s:b compiler.cppstd=20 `
+            -s:h build_type=${{ env.BUILD_TYPE }} `
+            -s:b build_type=${{ env.BUILD_TYPE }}
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          cmake -S . -B build `
+            -G "Visual Studio 17 2022" `
+            -A x64 `
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW `
+            -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}\build\generators\conan_toolchain.cmake" `
+            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}\out"
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+
+      - name: Install
+        shell: pwsh
+        run: cmake --install build --config ${{ env.BUILD_TYPE }}
+
+      - name: Package artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = Join-Path $env:GITHUB_WORKSPACE "out\bin\Denoiser.exe"
+          if (-not (Test-Path -LiteralPath $exe)) {
+              throw "Expected executable was not created: $exe"
+          }
+
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          $packageDir = Join-Path $env:RUNNER_TEMP "optix-denoiser-windows-x64-$shortSha"
+          $zipPath = Join-Path $env:RUNNER_TEMP "optix-denoiser-windows-x64-$shortSha.zip"
+          if (Test-Path -LiteralPath $packageDir) {
+              Remove-Item -LiteralPath $packageDir -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $packageDir | Out-Null
+
+          Copy-Item -LiteralPath $exe -Destination (Join-Path $packageDir "Denoiser.exe")
+          Copy-Item -LiteralPath "LICENSE" -Destination (Join-Path $packageDir "LICENSE")
+
+          $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $exe
+          $optixCommit = (& git -C contrib/optix rev-parse HEAD).Trim()
+          $manifest = [ordered]@{
+              name = "NvidiaAIDenoiser"
+              executable = "Denoiser.exe"
+              source_repository = "https://github.com/${{ github.repository }}.git"
+              source_ref = "${{ github.ref_name }}"
+              source_commit = "${{ github.sha }}"
+              optix_dev_repository = "https://github.com/NVIDIA/optix-dev.git"
+              optix_dev_commit = $optixCommit
+              cuda_version = "${{ env.CUDA_VERSION }}"
+              runner_os = "${{ runner.os }}"
+              runner_arch = "${{ runner.arch }}"
+              built_at_utc = (Get-Date).ToUniversalTime().ToString("o")
+              sha256 = $hash.Hash.ToLowerInvariant()
+              size_bytes = (Get-Item -LiteralPath $exe).Length
+          }
+          $manifest |
+              ConvertTo-Json -Depth 4 |
+              Set-Content -LiteralPath (Join-Path $packageDir "manifest.json") -Encoding utf8NoBOM
+
+          if (Test-Path -LiteralPath $zipPath) {
+              Remove-Item -LiteralPath $zipPath -Force
+          }
+          Compress-Archive -Path (Join-Path $packageDir "*") -DestinationPath $zipPath -Force
+          "PACKAGE_ZIP=$zipPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "Packaged $zipPath"
+          Write-Host "Denoiser.exe SHA256 $($hash.Hash)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: optix-denoiser-windows-x64-${{ github.sha }}
+          path: ${{ env.PACKAGE_ZIP }}
+          if-no-files-found: error
