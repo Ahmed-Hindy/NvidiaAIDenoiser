@@ -243,6 +243,75 @@ Raw EXR header comparison against the Canyon Run source:
 }
 ```
 
+## Multi-OptiX Build Validation
+
+The workflow was expanded at commit `fc927b7eaa5f0c949226f3d23e302ebb0f4e33cf`
+to build all requested OptiX SDK variants in one run.
+
+Validated branch-push run:
+
+```text
+run: 26032023808
+url: https://github.com/Ahmed-Hindy/NvidiaAIDenoiser/actions/runs/26032023808
+commit: fc927b7eaa5f0c949226f3d23e302ebb0f4e33cf
+status: success
+duration: about 27 minutes
+artifact: optix-denoiser-windows-x64-builds-fc927b7eaa5f0c949226f3d23e302ebb0f4e33cf
+artifact api id: 7057649399
+artifact size: 94500759 bytes
+```
+
+Downloaded artifact zips:
+
+```text
+optix-denoiser-windows-x64-optix-8.1-fc927b7.zip 31755736 bytes
+optix-denoiser-windows-x64-optix-9.0-fc927b7.zip 31755482 bytes
+optix-denoiser-windows-x64-optix-9.1-fc927b7.zip 31755888 bytes
+```
+
+Manifest checks:
+
+```text
+OptiX 8.1 -> v8.1.0 -> 50021ea0af6d41609a97777ceebbdf1e1d34efe7 -> Denoiser.exe 78138880 bytes
+OptiX 9.0 -> v9.0.0 -> fff65c2a7c592f1ea5f1661ad7d2381cf965f9bd -> Denoiser.exe 78138880 bytes
+OptiX 9.1 -> v9.1.0 -> f1f6dd803f3159992d248178f6e09421c6eb8b6d -> Denoiser.exe 78138880 bytes
+```
+
+Local `Denoiser.exe -h` sanity on RTX 3070:
+
+```text
+OptiX 8.1 -> found GPU, printed help
+OptiX 9.0 -> found GPU, printed help
+OptiX 9.1 -> found GPU, failed optixInit with error 7801
+```
+
+Local Canyon Run multipart denoise smoke:
+
+```text
+OptiX 8.1 -> denoise succeeded, output 66147779 bytes
+OptiX 9.0 -> denoise succeeded, output 66147779 bytes
+OptiX 9.1 -> not run because -h sanity failed OptiX initialization
+```
+
+Raw EXR header comparison for OptiX 8.1 and 9.0:
+
+```json
+{
+  "8.1": {
+    "source_part_count": 22,
+    "output_part_count": 22,
+    "raw_attribute_value_diff_count": 0,
+    "attribute_order_diff_count": 0
+  },
+  "9.0": {
+    "source_part_count": 22,
+    "output_part_count": 22,
+    "raw_attribute_value_diff_count": 0,
+    "attribute_order_diff_count": 0
+  }
+}
+```
+
 ## Notes For Future Agents
 
 - OptiX 9.0 (`fff65c2a7c592f1ea5f1661ad7d2381cf965f9bd`) is the currently
